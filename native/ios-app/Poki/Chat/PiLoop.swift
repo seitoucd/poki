@@ -42,9 +42,12 @@ final class PiLoop {
                 return Self.result(await call.value)
             }
         }
-        // agent/pi-session.mjs: low thinking, one tool call at a time.
+        // agent/pi-session.mjs: low thinking, one tool call at a time. Every request carries the whole
+        // conversation, so an unpruned one is what makes a long task cost so much: once there are more
+        // turns than this, the oldest go before the request is built.
         agent = Agent(AgentOptions(
             initialState: AgentState(model: model, thinkingLevel: .low, tools: agentTools, messages: messages),
+            transformContext: { messages, _ in keepRecentTurns(messages, turns: 4) },
             getApiKey: { _ in await ModelCredential.apiKey(for: provider) },
             toolExecution: .sequential
         ))
@@ -155,4 +158,18 @@ private final class Box: @unchecked Sendable {
     private var text: String?
     func set(_ value: String) { lock.withLock { if text == nil { text = value } } }
     var value: String? { lock.withLock { text } }
+}
+
+/// The conversation without its oldest turns. One request carries all of it, so a task that runs for
+/// dozens of steps pays for every earlier step again on each one; past a few turns that is most of the
+/// bill and none of the information the next step needs. The cut is made at a user message, so an
+/// assistant tool call always travels with the result it waits for.
+private func keepRecentTurns(_ messages: [AgentMessage], turns: Int) -> [AgentMessage] {
+    guard turns > 0, messages.count > 9 else { return messages }
+    let head = messages.prefix { $0.role == "system" }
+    let rest = messages.dropFirst(head.count)
+    var starts: [Int] = []
+    for (i, message) in rest.enumerated() where message.role == "user" { starts.append(i) }
+    guard starts.count > turns, let cut = starts.suffix(turns).first else { return messages }
+    return Array(head) + Array(rest.dropFirst(cut))
 }
