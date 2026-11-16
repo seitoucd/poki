@@ -47,7 +47,7 @@ final class PiLoop {
         // turns than this, the oldest go before the request is built.
         agent = Agent(AgentOptions(
             initialState: AgentState(model: model, thinkingLevel: .low, tools: agentTools, messages: messages),
-            transformContext: { messages, _ in keepRecentTurns(messages, turns: 4) },
+            transformContext: { messages, _ in budgetedHistory(messages, steps: 4) },
             getApiKey: { _ in await ModelCredential.apiKey(for: provider) },
             toolExecution: .sequential
         ))
@@ -160,16 +160,58 @@ private final class Box: @unchecked Sendable {
     var value: String? { lock.withLock { text } }
 }
 
-/// The conversation without its oldest turns. One request carries all of it, so a task that runs for
-/// dozens of steps pays for every earlier step again on each one; past a few turns that is most of the
-/// bill and none of the information the next step needs. The cut is made at a user message, so an
-/// assistant tool call always travels with the result it waits for.
-private func keepRecentTurns(_ messages: [AgentMessage], turns: Int) -> [AgentMessage] {
-    guard turns > 0, messages.count > 9 else { return messages }
-    let head = messages.prefix { $0.role == "system" }
-    let rest = messages.dropFirst(head.count)
-    var starts: [Int] = []
-    for (i, message) in rest.enumerated() where message.role == "user" { starts.append(i) }
-    guard starts.count > turns, let cut = starts.suffix(turns).first else { return messages }
-    return Array(head) + Array(rest.dropFirst(cut))
+/// The conversation as it is worth sending: the owner's request, the newest steps, and one screenshot.
+///
+/// A request carries the whole history, and 97 % of a task's tokens are that history sent again. Two
+/// things make it larger than it has to be: every step's screenshot stays in it, and a conversation
+/// that grows past a few steps only gets cheaper to re-send if the provider's prefix cache covers it —
+/// the screenshots, which change at every step, are what stop that cache from covering anything past
+/// the fixed prefix. So the old screenshots go (the newest stays, that is the screen being worked on)
+/// and only the last few steps are kept.
+private func budgetedHistory(_ messages: [AgentMessage], steps: Int) -> [AgentMessage] {
+    var kept = messages
+    if kept.count > 12, steps > 0 {
+        let head = Array(kept.prefix { $0.role == "system" })
+        let rest = Array(kept.dropFirst(head.count))
+        var starts: [Int] = []
+        for (i, message) in rest.enumerated() where message.role == "assistant" { starts.append(i) }
+        if starts.count > steps, let cut = starts.suffix(steps).first {
+            var shorter = head
+            if let asked = rest.firstIndex(where: { $0.role == "user" }), asked < cut { shorter.append(rest[asked]) }
+            shorter.append(contentsOf: rest[cut...])
+            kept = shorter
+        }
+    }
+    // Older steps keep their first lines only: a read is mostly a list of elements, and the list the
+    // next step needs is always the newest one.
+    var whole = 0
+    for i in kept.indices.reversed() {
+        guard case .toolResult(var result) = kept[i] else { continue }
+        if whole < 2 { whole += 1; continue }
+        result.content = result.content.map { block -> ContentBlock in
+            guard case .text(var text) = block, text.text.count > 400 else { return block }
+            text.text = String(text.text.prefix(400)) + " [rest of this older read left out]"
+            return .text(text)
+        }
+        kept[i] = .toolResult(result)
+    }
+    guard let newest = kept.lastIndex(where: { hasPicture($0) }) else { return kept }
+    for i in kept.indices where i != newest {
+        guard case .toolResult(var result) = kept[i], result.content.contains(where: { isPicture($0) }) else { continue }
+        result.content = result.content.flatMap { block -> [ContentBlock] in
+            isPicture(block) ? [.text(TextContent(text: "[screenshot of an earlier step, left out]"))] : [block]
+        }
+        kept[i] = .toolResult(result)
+    }
+    return kept
+}
+
+private func isPicture(_ block: ContentBlock) -> Bool {
+    if case .image = block { return true }
+    return false
+}
+
+private func hasPicture(_ message: AgentMessage) -> Bool {
+    if case .toolResult(let result) = message { return result.content.contains { isPicture($0) } }
+    return false
 }
